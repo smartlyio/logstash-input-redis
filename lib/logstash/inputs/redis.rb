@@ -3,6 +3,9 @@ require "logstash/namespace"
 require "logstash/inputs/base"
 require "logstash/inputs/threadable"
 require 'redis'
+require 'concurrent'
+require 'concurrent/executors'
+require "stud/interval"
 
 # This input will read events from a Redis instance; it supports both Redis channels and lists.
 # The list command (BLPOP) used by Logstash is supported in Redis v1.3.1+, and
@@ -49,9 +52,11 @@ module LogStash module Inputs class Redis < LogStash::Inputs::Threadable
   config :key, :validate => :string, :required => true
 
   # Specify either list or channel.  If `data_type` is `list`, then we will BLPOP the
-  # key.  If `data_type` is `channel`, then we will SUBSCRIBE to the key.
-  # If `data_type` is `pattern_channel`, then we will PSUBSCRIBE to the key.
-  config :data_type, :validate => [ "list", "channel", "pattern_channel" ], :required => true
+  # key. If `data_type` is `pattern_list`, then we will spawn a number of worker
+  # threads that will LPOP from keys matching that pattern. If `data_type` is
+  # `channel`, then we will SUBSCRIBE to the key. If `data_type` is `pattern_channel`,
+  # then we will PSUBSCRIBE to the key.
+  config :data_type, :validate => [ "list", "pattern_list", "channel", "pattern_channel" ], :required => true
 
   # The number of events to return from Redis using EVAL.
   config :batch_count, :validate => :number, :default => 125
@@ -59,33 +64,39 @@ module LogStash module Inputs class Redis < LogStash::Inputs::Threadable
   # Redefined Redis commands to be passed to the Redis client.
   config :command_map, :validate => :hash, :default => {}
 
+  # Maximum number of worker threads to spawn when using `data_type` `pattern_list`.
+  config :pattern_list_threads, :validate => :number, :default => 20
+
+  # Maximum number of items for a single worker thread to process when `data_type` is `pattern_list`.
+  # After the list is empty or this number of items have been processed, the thread will exit and a
+  # new one will be started if there are non-empty lists matching the pattern without a consumer.
+  config :pattern_list_max_items, :validate => :number, :default => 1000
+
+  # Time to sleep in main loop after checking if more threads can/need to be spawned.
+  # Applies to `data_type` is `pattern_list`
+  config :pattern_list_threadpool_sleep, :validate => :number, :default => 0.2
+
   public
-  # public API
-  # use to store a proc that can provide a Redis instance or mock
-  def add_external_redis_builder(builder) #callable
-    @redis_builder = builder
-    self
-  end
 
-  # use to apply an instance directly and bypass the builder
-  def use_redis(instance)
-    @redis = instance
-    self
-  end
-
-  def new_redis_instance
-    @redis_builder.call
+  def init_threadpool
+    @threadpool ||= Concurrent::ThreadPoolExecutor.new(
+        min_threads: @pattern_list_threads,
+        max_threads: @pattern_list_threads,
+        max_queue: 2 * @pattern_list_threads
+    )
+    @current_workers ||= Concurrent::Set.new
   end
 
   def register
     @redis_url = @path.nil? ? "redis://#{@password}@#{@host}:#{@port}/#{@db}" : "#{@password}@#{@path}/#{@db}"
 
-    @redis_builder ||= method(:internal_redis_builder)
-
     # just switch on data_type once
     if @data_type == 'list' || @data_type == 'dummy'
       @run_method = method(:list_runner)
       @stop_method = method(:list_stop)
+    elsif @data_type == 'pattern_list'
+      @run_method = method(:pattern_list_runner)
+      @stop_method = method(:pattern_list_stop)
     elsif @data_type == 'channel'
       @run_method = method(:channel_runner)
       @stop_method = method(:subscribe_stop)
@@ -93,8 +104,6 @@ module LogStash module Inputs class Redis < LogStash::Inputs::Threadable
       @run_method = method(:pattern_channel_runner)
       @stop_method = method(:subscribe_stop)
     end
-
-    @list_method = batched? ? method(:list_batch_listener) : method(:list_single_listener)
 
     @identity = "#{@redis_url} #{@data_type}:#{@key}"
     @logger.info("Registering Redis", :identity => @identity)
@@ -119,35 +128,30 @@ module LogStash module Inputs class Redis < LogStash::Inputs::Threadable
 
   # private
   def is_list_type?
-    @data_type == 'list'
+    @data_type == 'list' || @data_type == 'pattern_list'
   end
 
   # private
   def redis_params
-    if @path.nil?
-      connectionParams = {
-        :host => @host,
-        :port => @port
-      }
-    else
-      @logger.warn("Parameter 'path' is set, ignoring parameters: 'host' and 'port'")
-      connectionParams = {
-        :path => @path
-      }
-    end
-
-    baseParams = {
-      :timeout => @timeout,
-      :db => @db,
-      :password => @password.nil? ? nil : @password.value,
-      :ssl => @ssl
+    params = {
+        :timeout => @timeout,
+        :db => @db,
+        :password => @password.nil? ? nil : @password.value,
+        :ssl => @ssl
     }
 
-    return connectionParams.merge(baseParams)
+    if @path.nil?
+      params[:host] = @host
+      params[:port] = @port
+    else
+      @logger.warn("Parameter 'path' is set, ignoring parameters: 'host' and 'port'")
+      params[:path] = @path
+    end
+
+    params
   end
 
-  # private
-  def internal_redis_builder
+  def new_redis_instance
     ::Redis.new(redis_params)
   end
 
@@ -156,14 +160,12 @@ module LogStash module Inputs class Redis < LogStash::Inputs::Threadable
     redis = new_redis_instance
 
     # register any renamed Redis commands
-    if @command_map.any?
-      client_command_map = redis.client.command_map
-      @command_map.each do |name, renamed|
-        client_command_map[name.to_sym] = renamed.to_sym
-      end
+    @command_map.each do |name, renamed|
+      redis._client.command_map[name.to_sym] = renamed.to_sym
     end
 
     load_batch_script(redis) if batched? && is_list_type?
+
     redis
   end # def connect
 
@@ -193,40 +195,142 @@ EOF
   end
 
   # private
-  def list_stop
-    return if @redis.nil? || !@redis.connected?
+  def reset_redis
+    redis = @redis # might change during method invocation
+    return if redis.nil? || !redis.connected?
 
-    @redis.quit rescue nil
+    redis.quit rescue nil # does client.disconnect internally
+    # check if input retried while executing
+    list_stop unless redis.equal? @redis
     @redis = nil
   end
 
   # private
+  def list_stop
+    reset_redis
+  end
+
+  # private
   def list_runner(output_queue)
+    @list_method = batched? ? method(:list_batch_listener) : method(:list_single_listener)
     while !stop?
       begin
         @redis ||= connect
         @list_method.call(@redis, output_queue)
-      rescue ::Redis::BaseError => e
-        @logger.warn("Redis connection problem", :exception => e)
-        # Reset the redis variable to trigger reconnect
-        @redis = nil
-        # this sleep does not need to be stoppable as its
-        # in a while !stop? loop
-        sleep 1
+      rescue => e
+        log_error(e)
+        retry if reset_for_error_retry(e)
       end
     end
   end
 
-  def list_batch_listener(redis, output_queue)
+  #private
+  def reset_threadpool
+    return if @threadpool.nil?
+    @threadpool.shutdown
+    @threadpool.wait_for_termination
+    @threadpool = nil
+  end
+
+  # private
+  def pattern_list_stop
+    reset_redis
+    reset_threadpool
+  end
+
+  # private
+  def pattern_list_process_item(redis, output_queue, key)
+    if stop?
+      @logger.debug("Breaking from thread #{key} as it was requested to stop")
+      return false
+    end
+    value = redis.lpop(key)
+    return false if value.nil?
+    queue_event(value, output_queue)
+    true
+  end
+
+  # private
+  def pattern_list_single_processor(redis, output_queue, key)
+    (0...@pattern_list_max_items).each do
+      break unless pattern_list_process_item(redis, output_queue, key)
+    end
+  end
+
+  # private
+  def pattern_list_batch_processor(redis, output_queue, key)
+    items_left = @pattern_list_max_items
+    while items_left > 0
+      limit = [items_left, @batch_count].min
+      processed = process_batch(redis, output_queue, key, limit, 0)
+      if processed.zero? || processed < limit
+        return
+      end
+      items_left -= processed
+    end
+  end
+
+  # private
+  def pattern_list_worker_consume(output_queue, key)
     begin
-      results = redis.evalsha(@redis_script_sha, [@key], [@batch_count-1])
+      redis ||= connect
+      @pattern_list_processor.call(redis, output_queue, key)
+    rescue ::Redis::BaseError => e
+      @logger.warn("Redis connection problem in thread for key #{key}. Sleeping a while before exiting thread.", :exception => e)
+      sleep 1
+      return
+    ensure
+      redis.quit rescue nil
+    end
+  end
+
+  # private
+  def threadpool_capacity?
+    @threadpool.remaining_capacity > 0
+  end
+
+  # private
+  def pattern_list_launch_worker(output_queue, key)
+    @current_workers.add(key)
+    @threadpool.post do
+      begin
+        pattern_list_worker_consume(output_queue, key)
+      ensure
+        @current_workers.delete(key)
+      end
+    end
+  end
+
+  # private
+  def pattern_list_ensure_workers(output_queue)
+    return unless threadpool_capacity?
+    redis_runner do
+      @redis.keys(@key).shuffle.each do |key|
+        next if @current_workers.include?(key)
+        pattern_list_launch_worker(output_queue, key)
+        break unless threadpool_capacity?
+      end
+    end
+  end
+
+  # private
+  def pattern_list_runner(output_queue)
+    @pattern_list_processor = batched? ? method(:pattern_list_batch_processor) : method(:pattern_list_single_processor)
+    while !stop?
+      init_threadpool if @threadpool.nil?
+      pattern_list_ensure_workers(output_queue)
+      sleep(@pattern_list_threadpool_sleep)
+    end
+  end
+
+  def process_batch(redis, output_queue, key, batch_size, sleep_time)
+    begin
+      results = redis.evalsha(@redis_script_sha, [key], [batch_size-1])
       results.each do |item|
         queue_event(item, output_queue)
       end
-
-      if results.size.zero?
-        sleep BATCH_EMPTY_SLEEP
-      end
+      sleep sleep_time if results.size.zero? && sleep_time > 0
+      results.size
 
       # Below is a commented-out implementation of 'batch fetch'
       # using pipelined LPOP calls. This in practice has been observed to
@@ -255,6 +359,10 @@ EOF
     end
   end
 
+  def list_batch_listener(redis, output_queue)
+    process_batch(redis, output_queue, @key, @batch_count, BATCH_EMPTY_SLEEP)
+  end
+
   def list_single_listener(redis, output_queue)
     item = redis.blpop(@key, 0, :timeout => 1)
     return unless item # from timeout or other conditions
@@ -266,18 +374,19 @@ EOF
 
   # private
   def subscribe_stop
-    return if @redis.nil? || !@redis.connected?
-    # if its a SubscribedClient then:
-    # it does not have a disconnect method (yet)
-    if @redis.client.is_a?(::Redis::SubscribedClient)
+    redis = @redis # might change during method invocation
+    return if redis.nil? || !redis.connected?
+
+    if redis.subscribed?
       if @data_type == 'pattern_channel'
-        @redis.client.punsubscribe
+        redis.punsubscribe
       else
-        @redis.client.unsubscribe
+        redis.unsubscribe
       end
-    else
-      @redis.client.disconnect
     end
+    redis.close rescue nil # does client.disconnect
+    # check if input retried while executing
+    subscribe_stop unless redis.equal? @redis
     @redis = nil
   end
 
@@ -286,13 +395,41 @@ EOF
     begin
       @redis ||= connect
       yield
-    rescue ::Redis::BaseError => e
-      @logger.warn("Redis connection problem", :exception => e)
-      # Reset the redis variable to trigger reconnect
-      @redis = nil
-      Stud.stoppable_sleep(1) { stop? }
-      retry if !stop?
+    rescue => e
+      log_error(e)
+      retry if reset_for_error_retry(e)
     end
+  end
+
+  def log_error(e)
+    info = { message: e.message, exception: e.class }
+    info[:backtrace] = e.backtrace if @logger.debug?
+
+    case e
+    when ::Redis::TimeoutError
+      # expected for channels in case no data is available
+      @logger.debug("Redis timeout, retrying", info)
+    when ::Redis::BaseConnectionError, ::Redis::ProtocolError
+      @logger.warn("Redis connection error", info)
+    when ::Redis::BaseError
+      @logger.error("Redis error", info)
+    when ::LogStash::ShutdownSignal
+      @logger.debug("Received shutdown signal")
+    else
+      info[:backtrace] ||= e.backtrace
+      @logger.error("Unexpected error", info)
+    end
+  end
+
+  # @return [true] if operation is fine to retry
+  def reset_for_error_retry(e)
+    return if e.is_a?(::LogStash::ShutdownSignal)
+
+    # Reset the redis variable to trigger reconnect
+    @redis = nil
+
+    Stud.stoppable_sleep(1) { stop? }
+    !stop? # retry if not stop-ing
   end
 
   # private
@@ -341,7 +478,5 @@ EOF
       end
     end
   end
-
-# end
 
 end end end # Redis Inputs  LogStash
